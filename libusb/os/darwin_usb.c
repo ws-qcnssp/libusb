@@ -3645,20 +3645,40 @@ static int darwin_attach_kernel_driver (struct libusb_device_handle *dev_handle,
 
 static int darwin_capture_claim_interface(struct libusb_device_handle *dev_handle, uint8_t iface) REQUIRES(dev_handle->lock) {
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
+  bool counted = false;
   int ret;
-  if (dev_handle->auto_detach_kernel_driver && darwin_kernel_driver_active(dev_handle, iface)) {
+  if (dev_handle->auto_detach_kernel_driver) {
+    const int driver_active = darwin_kernel_driver_active(dev_handle, iface);
+
     /* the core holds dev_handle->lock around this backend call, so take only
        dpriv->lock here (the darwin_detach_kernel_driver entry point would
        take dev_handle->lock again and self-deadlock) */
     usbi_mutex_lock(&dpriv->lock);
-    ret = darwin_detach_kernel_driver_locked (dev_handle, iface);
-    usbi_mutex_unlock(&dpriv->lock);
-    if (ret != LIBUSB_SUCCESS) {
-      usbi_info (usbi_handle_ctx (dev_handle), "failed to auto-detach the kernel driver for this device, ret=%d", ret);
+    if (driver_active) {
+      ret = darwin_detach_kernel_driver_locked (dev_handle, iface);
+      if (ret != LIBUSB_SUCCESS) {
+        usbi_info (usbi_handle_ctx (dev_handle), "failed to auto-detach the kernel driver for this device, ret=%d", ret);
+      } else {
+        counted = true;
+      }
+    } else if (dpriv->capture_count > 0) {
+      /* a captured device has no kernel driver on any interface. count this
+         claim anyway: darwin_capture_release_interface drops the count on
+         every release and hands the device back when it reaches zero */
+      dpriv->capture_count++;
+      counted = true;
     }
+    usbi_mutex_unlock(&dpriv->lock);
   }
 
-  return darwin_claim_interface (dev_handle, iface);
+  ret = darwin_claim_interface (dev_handle, iface);
+  if (ret != LIBUSB_SUCCESS && counted) {
+    usbi_mutex_lock(&dpriv->lock);
+    (void) darwin_attach_kernel_driver_locked (dev_handle, iface);
+    usbi_mutex_unlock(&dpriv->lock);
+  }
+
+  return ret;
 }
 
 static int darwin_capture_release_interface(struct libusb_device_handle *dev_handle, uint8_t iface) REQUIRES(dev_handle->lock) {
