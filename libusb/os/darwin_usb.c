@@ -2336,6 +2336,9 @@ static int darwin_claim_interface(struct libusb_device_handle *dev_handle, uint8
   kresult = (*IOINTERFACE(cInterface))->USBInterfaceOpen(IOINTERFACE(cInterface));
   if (kresult != kIOReturnSuccess) {
     usbi_info (ctx, "USBInterfaceOpen: %s", darwin_error_str(kresult));
+    /* the interface was never opened: release it so a retry does not leak it */
+    (*IOINTERFACE(cInterface))->Release (IOINTERFACE(cInterface));
+    IOINTERFACE(cInterface) = NULL;
     return darwin_to_libusb (kresult);
   }
 
