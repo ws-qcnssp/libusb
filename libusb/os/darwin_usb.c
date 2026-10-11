@@ -44,6 +44,11 @@
  * does not return error status on macOS. */
 #define DARWIN_REENUMERATE_TIMEOUT_US (10ULL * USEC_PER_SEC)
 
+/* Capturing a device returns before the system driver has released its interfaces, so a
+ * claim of a captured device is retried while it fails with exclusive access. */
+#define DARWIN_CAPTURE_CLAIM_TIMEOUT_US (2ULL * USEC_PER_SEC)
+#define DARWIN_CAPTURE_CLAIM_DELAY_US (50ULL * 1000ULL)
+
 #include <AvailabilityMacros.h>
 #if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060 && MAC_OS_X_VERSION_MIN_REQUIRED < 101200
   #include <objc/objc-auto.h>
@@ -3672,6 +3677,15 @@ static int darwin_capture_claim_interface(struct libusb_device_handle *dev_handl
   }
 
   ret = darwin_claim_interface (dev_handle, iface);
+
+  /* dpriv->lock is not held while waiting, so claims of other handles can proceed */
+  for (uint64_t waited = 0 ; LIBUSB_ERROR_ACCESS == ret && counted && waited < DARWIN_CAPTURE_CLAIM_TIMEOUT_US ;
+       waited += DARWIN_CAPTURE_CLAIM_DELAY_US) {
+    const struct timespec delay = {.tv_sec = 0, .tv_nsec = (long) (DARWIN_CAPTURE_CLAIM_DELAY_US * 1000ULL)};
+    nanosleep (&delay, NULL);
+    ret = darwin_claim_interface (dev_handle, iface);
+  }
+
   if (ret != LIBUSB_SUCCESS && counted) {
     usbi_mutex_lock(&dpriv->lock);
     (void) darwin_attach_kernel_driver_locked (dev_handle, iface);
