@@ -123,9 +123,14 @@ struct darwin_cached_device {
      GUARDED_BY(darwin_cached_devices_mutex) */
   usb_device_t          pending_device;
   io_service_t          pending_service;
-  usbi_mutex_t          lock;          /* protects open_count, capture_count and langid */
+  usbi_mutex_t          lock;          /* protects open_count, capture_count, langid and the open state */
   int                   open_count;    /* GUARDED_BY(lock) */
   int                   capture_count; /* GUARDED_BY(lock) */
+  /* open state, owned by the device: the handle that opens the device first
+     is not necessarily the one that closes it last */
+  bool                  is_open;       /* GUARDED_BY(lock) */
+  CFRunLoopRef          runloop;       /* GUARDED_BY(lock), retained run loop cfSource is registered on */
+  CFRunLoopSourceRef    cfSource;      /* GUARDED_BY(lock) */
   UInt16                langid;        /* GUARDED_BY(lock), cached primary string-descriptor language ID, 0 if not yet known */
   UInt8                 port;
   /* first_config and active_config are written by darwin_check_configuration
@@ -154,10 +159,6 @@ struct darwin_interface {
 };
 
 struct darwin_device_handle_priv {
-  bool                 is_open;
-  CFRunLoopRef         runloop;  /* retained run loop cfSource is registered on */
-  CFRunLoopSourceRef   cfSource;
-
   struct darwin_interface interfaces[USB_MAXINTERFACES];
 };
 

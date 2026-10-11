@@ -1890,16 +1890,17 @@ static enum libusb_error darwin_scan_devices(struct libusb_context *ctx) {
   return LIBUSB_SUCCESS;
 }
 
-static void darwin_device_release_event_source (struct darwin_device_handle_priv *priv) {
-  if (priv->cfSource) {
-    assert (NULL != priv->runloop);  /* retained before the source is created */
-    CFRunLoopRemoveSource (priv->runloop, priv->cfSource, kCFRunLoopCommonModes);
-    CFRelease (priv->cfSource);
-    priv->cfSource = NULL;
+/* must be called while holding dpriv->lock */
+static void darwin_device_release_event_source (struct darwin_cached_device *dpriv) {
+  if (dpriv->cfSource) {
+    assert (NULL != dpriv->runloop);  /* retained before the source is created */
+    CFRunLoopRemoveSource (dpriv->runloop, dpriv->cfSource, kCFRunLoopCommonModes);
+    CFRelease (dpriv->cfSource);
+    dpriv->cfSource = NULL;
   }
-  if (priv->runloop) {
-    CFRelease (priv->runloop);
-    priv->runloop = NULL;
+  if (dpriv->runloop) {
+    CFRelease (dpriv->runloop);
+    dpriv->runloop = NULL;
   }
 }
 
@@ -1938,7 +1939,6 @@ static CFRunLoopRef darwin_retain_event_runloop (void) CF_RETURNS_RETAINED EXCLU
 
 /* must be called while holding dpriv->lock */
 static int darwin_open_locked (struct libusb_device_handle *dev_handle) {
-  struct darwin_device_handle_priv *priv = (struct darwin_device_handle_priv *)usbi_get_device_handle_priv(dev_handle);
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
   IOReturn kresult;
 
@@ -1957,46 +1957,46 @@ static int darwin_open_locked (struct libusb_device_handle *dev_handle) {
       }
 
       /* it is possible to perform some actions on a device that is not open so do not return an error */
-      priv->is_open = false;
+      dpriv->is_open = false;
     } else {
-      priv->is_open = true;
+      dpriv->is_open = true;
     }
 
-    priv->runloop = darwin_retain_event_runloop ();
-    if (NULL == priv->runloop) {
+    dpriv->runloop = darwin_retain_event_runloop ();
+    if (NULL == dpriv->runloop) {
       usbi_err (usbi_handle_ctx (dev_handle), "no event thread run loop, cannot open device");
 
-      if (priv->is_open) {
+      if (dpriv->is_open) {
         (*dpriv->device)->USBDeviceClose (dpriv->device);
       }
 
-      priv->is_open = false;
+      dpriv->is_open = false;
 
       return LIBUSB_ERROR_OTHER;
     }
 
     /* create async event source */
     kresult = (*dpriv->device)->CreateDeviceAsyncEventSource (dpriv->device,
-                                                                                &priv->cfSource);
+                                                                                &dpriv->cfSource);
     if (kresult != kIOReturnSuccess) {
       usbi_err (usbi_handle_ctx (dev_handle), "CreateDeviceAsyncEventSource: %s", darwin_error_str(kresult));
 
       /* the handle can still be closed, so leave no source behind */
-      priv->cfSource = NULL;
-      CFRelease (priv->runloop);
-      priv->runloop = NULL;
+      dpriv->cfSource = NULL;
+      CFRelease (dpriv->runloop);
+      dpriv->runloop = NULL;
 
-      if (priv->is_open) {
+      if (dpriv->is_open) {
         (*dpriv->device)->USBDeviceClose (dpriv->device);
       }
 
-      priv->is_open = false;
+      dpriv->is_open = false;
 
       return darwin_to_libusb (kresult);
     }
 
     /* add the cfSource to the async run loop */
-    CFRunLoopAddSource(priv->runloop, priv->cfSource, kCFRunLoopCommonModes);
+    CFRunLoopAddSource(dpriv->runloop, dpriv->cfSource, kCFRunLoopCommonModes);
   }
 
   /* device opened successfully */
@@ -2021,7 +2021,6 @@ static int darwin_open (struct libusb_device_handle *dev_handle) {
 /* must be called while holding dpriv->lock. any claimed interfaces must have
    been released by the caller beforehand. */
 static void darwin_close_locked (struct libusb_device_handle *dev_handle) {
-  struct darwin_device_handle_priv *priv = (struct darwin_device_handle_priv *)usbi_get_device_handle_priv(dev_handle);
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
   IOReturn kresult;
 
@@ -2035,17 +2034,19 @@ static void darwin_close_locked (struct libusb_device_handle *dev_handle) {
   if (NULL == dpriv->device) {
     usbi_warn (usbi_handle_ctx (dev_handle), "darwin_close device missing IOService");
 
-    /* the core frees the handle after close returns, so remove the source and
-       decrement the run loop reference count here */
-    darwin_device_release_event_source (priv);
+    /* the device is gone, but its source and run loop reference are still held */
+    if (0 == dpriv->open_count) {
+      darwin_device_release_event_source (dpriv);
+      dpriv->is_open = false;
+    }
     return;
   }
 
   if (0 == dpriv->open_count) {
     /* delete the device's async event source */
-    darwin_device_release_event_source (priv);
+    darwin_device_release_event_source (dpriv);
 
-    if (priv->is_open) {
+    if (dpriv->is_open) {
       /* close the device */
       kresult = (*dpriv->device)->USBDeviceClose(dpriv->device);
       if (kresult != kIOReturnSuccess) {
@@ -2053,6 +2054,7 @@ static void darwin_close_locked (struct libusb_device_handle *dev_handle) {
          * close isn't really an error, so return success anyway */
         usbi_warn (usbi_handle_ctx (dev_handle), "USBDeviceClose: %s", darwin_error_str(kresult));
       }
+      dpriv->is_open = false;
     }
   }
 }
@@ -2566,7 +2568,6 @@ static int darwin_clear_halt(struct libusb_device_handle *dev_handle, unsigned c
 static enum libusb_error darwin_restore_state (struct libusb_device_handle *dev_handle, uint8_t active_config,
                                                unsigned long claimed_interfaces) REQUIRES(dev_handle->lock) {
   struct darwin_cached_device *dpriv = DARWIN_CACHED_DEVICE(dev_handle->dev);
-  struct darwin_device_handle_priv *priv = (struct darwin_device_handle_priv *)usbi_get_device_handle_priv(dev_handle);
   int open_count = dpriv->open_count;
   int ret;
 
@@ -2576,7 +2577,7 @@ static enum libusb_error darwin_restore_state (struct libusb_device_handle *dev_
   dev_handle->claimed_interfaces = 0;
 
   /* close and re-open the device */
-  priv->is_open = false;
+  dpriv->is_open = false;
   dpriv->open_count = 1;
 
   /* clean up open interfaces */
